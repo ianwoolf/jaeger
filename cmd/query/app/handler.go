@@ -256,21 +256,90 @@ func (aH *APIHandler) dependencies(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	service := r.FormValue(serviceParam)
 
 	if lookback == 0 {
 		lookback = defaultDependencyLookbackDuration
 	}
-	endTs := time.Unix(0, 0).Add(time.Duration(endTsMillis) * time.Millisecond)
+	endTs := time.Unix(0, 0).Add(time.Duration(endTsMillis*1000) * time.Microsecond)
+	startTs := time.Unix(0, 0).Add((time.Duration(endTsMillis*1000) - 60*60*1000*1000) * time.Microsecond)
+	// dependencies, err := aH.dependencyReader.GetDependencies(endTs, lookback)
+	// if aH.handleError(w, err, http.StatusInternalServerError) {
+	// 	return
+	// }
 
-	dependencies, err := aH.dependencyReader.GetDependencies(endTs, lookback)
-	if aH.handleError(w, err, http.StatusInternalServerError) {
+	// filteredDependencies := aH.filterDependenciesByService(dependencies, service)
+	// structuredRes := structuredResponse{
+	// 	Data: aH.deduplicateDependencies(filteredDependencies),
+	// }`
+	// aH.writeJSON(w, &structuredRes)
+
+	if r.FormValue(serviceParam) == "" {
+		r.Form.Set(serviceParam, "customer")
+	}
+	tQuery, err := aH.queryParser.parse(r)
+	if aH.handleError(w, err, http.StatusBadRequest) {
 		return
 	}
 
-	filteredDependencies := aH.filterDependenciesByService(dependencies, service)
+	tQuery.TraceQueryParameters.NumTraces = 20
+	tQuery.TraceQueryParameters.StartTimeMax = endTs
+	tQuery.TraceQueryParameters.StartTimeMin = startTs
+
+	var tracesFromStorage []*model.Trace
+	if len(tQuery.traceIDs) > 0 {
+		tracesFromStorage, _, err = aH.tracesByIDs(tQuery.traceIDs)
+		if aH.handleError(w, err, http.StatusInternalServerError) {
+			return
+		}
+	} else {
+		tracesFromStorage, err = aH.spanReader.FindTraces(&tQuery.TraceQueryParameters)
+		if aH.handleError(w, err, http.StatusInternalServerError) {
+			return
+		}
+	}
+
+	findSpan := func(trace *model.Trace, spanID model.SpanID) *model.Span {
+		for _, s := range trace.Spans {
+			if s.SpanID == spanID {
+				return s
+			}
+		}
+		return nil
+	}
+
+	deps := map[string]*model.DependencyLink{}
+	adj := adjuster.SpanIDDeduper()
+
+	for _, orig := range tracesFromStorage {
+		trace, _ := adj.Adjust(orig)
+		for _, s := range trace.Spans {
+			parentSpan := findSpan(trace, s.ParentSpanID)
+			if parentSpan != nil {
+				if parentSpan.Process.ServiceName == s.Process.ServiceName {
+					continue
+				}
+				depKey := parentSpan.Process.ServiceName + "&&&" + s.Process.ServiceName
+				if _, ok := deps[depKey]; !ok {
+					deps[depKey] = &model.DependencyLink{
+						Parent:    parentSpan.Process.ServiceName,
+						Child:     s.Process.ServiceName,
+						CallCount: 1,
+					}
+				} else {
+					deps[depKey].CallCount++
+				}
+			}
+
+		}
+	}
+	retMe := make([]model.DependencyLink, 0, len(deps))
+	for _, dep := range deps {
+		retMe = append(retMe, *dep)
+	}
+
 	structuredRes := structuredResponse{
-		Data: aH.deduplicateDependencies(filteredDependencies),
+		Data:   retMe,
+		Errors: nil,
 	}
 	aH.writeJSON(w, &structuredRes)
 }
